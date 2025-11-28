@@ -93,6 +93,10 @@ tempo-cli: ## Build tempo-cli
 tempo-vulture:
 	$(GO_ENV) go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-vulture-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-vulture
 
+.PHONY: tempo-mcp  ## Build tempo-mcp
+tempo-mcp:
+	$(GO_ENV) go build $(GO_OPT) -o ./bin/$(GOOS)/tempo-mcp-$(GOARCH) $(BUILD_INFO) ./cmd/tempo-mcp
+
 .PHONY: exe  ## Build exe
 exe:
 	GOOS=linux make $(COMPONENT)

@@ -35,6 +35,8 @@ const (
 	toolGetAttributeNames     = "get-attribute-names"
 	toolGetAttributeValues    = "get-attribute-values"
 	toolDocsTraceQL           = "docs-traceql"
+	toolListInstances         = "list-instances"
+	toolListTenants           = "list-tenants"
 )
 
 // fakeHTTPAuthMiddleware is a middleware that does nothing, used when multitenancy is disabled
@@ -46,8 +48,9 @@ var fakeHTTPAuthMiddleware = middleware.Func(func(next http.Handler) http.Handle
 
 // MCPServer wraps the mcp-go server with Tempo-specific functionality
 type MCPServer struct {
-	logger   log.Logger
-	frontend *QueryFrontend // Assuming Frontend is defined elsewhere in your code
+	logger    log.Logger
+	frontend  *QueryFrontend // Assuming Frontend is defined elsewhere in your code
+	instances []MCPInstanceConfig
 
 	mcpServer  *server.MCPServer
 	httpServer *server.StreamableHTTPServer
@@ -56,8 +59,14 @@ type MCPServer struct {
 	httpHandler http.Handler
 }
 
+type MCPInstanceConfig struct {
+	Name     string   `yaml:"name"`
+	Endpoint string   `yaml:"endpoint"`
+	Tenants  []string `yaml:"tenants,omitempty"`
+}
+
 // NewMCPServer creates a new MCP server instance
-func NewMCPServer(frontend *QueryFrontend, pathPrefix string, logger log.Logger, authMiddleware middleware.Interface) *MCPServer {
+func NewMCPServer(frontend *QueryFrontend, pathPrefix string, logger log.Logger, authMiddleware middleware.Interface, instances []MCPInstanceConfig) *MCPServer {
 	// Create the underlying MCP server
 	mcpServer := server.NewMCPServer(
 		"tempo",
@@ -74,6 +83,7 @@ func NewMCPServer(frontend *QueryFrontend, pathPrefix string, logger log.Logger,
 	s := &MCPServer{
 		logger:     logger,
 		frontend:   frontend,
+		instances:  instances,
 		mcpServer:  mcpServer,
 		httpServer: httpServer,
 		pathPrefix: pathPrefix,
@@ -201,8 +211,27 @@ func (s *MCPServer) setupResources() {
 
 // setupTools registers MCP tools for trace operations
 func (s *MCPServer) setupTools() {
+	isInstanceAware := len(s.instances) > 0
+
+	// multi-instance and multi-tenancy tools
+	if isInstanceAware {
+		listInstancesTool := newReadOnlyTool(toolListInstances, false,
+			mcp.WithDescription("List all Tempo instances"),
+		)
+		s.mcpServer.AddTool(listInstancesTool, s.handleListInstances)
+
+		listTenantsTool := newReadOnlyTool(toolListTenants, false,
+			mcp.WithDescription("List all tenants for a given Tempo instance"),
+			mcp.WithString("instance",
+				mcp.Required(),
+				mcp.Description("The name of the Tempo instance"),
+			),
+		)
+		s.mcpServer.AddTool(listTenantsTool, s.handleListTenants)
+	}
+
 	// api tools
-	searchTool := newReadOnlyTool(toolTraceQLSearch,
+	searchTool := newReadOnlyTool(toolTraceQLSearch, isInstanceAware,
 		mcp.WithDescription("Search for traces using TraceQL queries"),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -217,7 +246,7 @@ func (s *MCPServer) setupTools() {
 	)
 	s.mcpServer.AddTool(searchTool, s.handleSearch)
 
-	instantQueryTool := newReadOnlyTool(toolTraceQLMetricsInstant,
+	instantQueryTool := newReadOnlyTool(toolTraceQLMetricsInstant, isInstanceAware,
 		mcp.WithDescription("Retrieve a single metric value given a TraceQL metrics query. The value is at the current instant or end. Most metrics questions can be answered with instant values."),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -234,7 +263,7 @@ func (s *MCPServer) setupTools() {
 	s.mcpServer.AddTool(instantQueryTool, s.handleInstantQuery)
 
 	// TODO: should we even expose this? the LLM would be better at using the instant query tool and giving accurate answers.
-	rangeQueryTool := newReadOnlyTool(toolTraceQLMetricsRange,
+	rangeQueryTool := newReadOnlyTool(toolTraceQLMetricsRange, isInstanceAware,
 		mcp.WithDescription("Retrieve a metric series given a TraceQL metrics query. The series ranges from start to end."),
 		mcp.WithString("query",
 			mcp.Required(),
@@ -250,7 +279,7 @@ func (s *MCPServer) setupTools() {
 	)
 	s.mcpServer.AddTool(rangeQueryTool, s.handleRangeQuery)
 
-	traceTool := newReadOnlyTool(toolGetTrace,
+	traceTool := newReadOnlyTool(toolGetTrace, isInstanceAware,
 		mcp.WithDescription("Retrieve a specific trace by ID"),
 		mcp.WithString("trace_id",
 			mcp.Required(),
@@ -260,7 +289,7 @@ func (s *MCPServer) setupTools() {
 	)
 	s.mcpServer.AddTool(traceTool, s.handleGetTrace)
 
-	attributeNamesTool := newReadOnlyTool(toolGetAttributeNames,
+	attributeNamesTool := newReadOnlyTool(toolGetAttributeNames, isInstanceAware,
 		mcp.WithDescription("Get a list of available attribute names that can be used in TraceQL queries. This is useful for finding the names of attributes that can be used in a query."),
 		mcp.WithString("scope",
 			mcp.Description("Optional scope to filter attributes by (span, resource, event, link, instrumentation). If not provided, returns all attributes."),
@@ -269,7 +298,7 @@ func (s *MCPServer) setupTools() {
 	)
 	s.mcpServer.AddTool(attributeNamesTool, s.handleGetAttributeNames)
 
-	attributeValuesTool := newReadOnlyTool(toolGetAttributeValues,
+	attributeValuesTool := newReadOnlyTool(toolGetAttributeValues, isInstanceAware,
 		mcp.WithDescription("Get a list of values for a fully scoped attribute name. This is useful for finding the values of a specific attribute. i.e. you can find all the services in the data by asking for resource.service.name"),
 		mcp.WithString("name",
 			mcp.Required(),
@@ -285,7 +314,7 @@ func (s *MCPServer) setupTools() {
 
 	// docs tools - these are defined as tools as well as resources b/c claude code never asks for resources but it will nicely
 	// request the content from these docs tools.
-	traceQLDocs := newReadOnlyTool(toolDocsTraceQL,
+	traceQLDocs := newReadOnlyTool(toolDocsTraceQL, false,
 		mcp.WithDescription(docsTraceQLQueryDescription),
 		mcp.WithString("name",
 			mcp.Required(),
@@ -297,7 +326,7 @@ func (s *MCPServer) setupTools() {
 	s.mcpServer.AddTool(traceQLDocs, s.handleTraceQLDocs)
 }
 
-func newReadOnlyTool(name string, opts ...mcp.ToolOption) mcp.Tool {
+func newReadOnlyTool(name string, isInstanceAware bool, opts ...mcp.ToolOption) mcp.Tool {
 	standardReadOnlyOpts := []mcp.ToolOption{
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
@@ -305,6 +334,19 @@ func newReadOnlyTool(name string, opts ...mcp.ToolOption) mcp.Tool {
 	}
 
 	opts = append(opts, standardReadOnlyOpts...)
+
+	if isInstanceAware {
+		instanceAwareOpts := []mcp.ToolOption{
+			mcp.WithString("instance",
+				mcp.Description("The name of the Tempo instance to query"),
+				mcp.Required(),
+			),
+			mcp.WithString("tenant",
+				mcp.Description("The tenant to query. This field is only required for multi-tenant Tempo instances."),
+			),
+		}
+		opts = append(opts, instanceAwareOpts...)
+	}
 
 	return mcp.NewTool(name, opts...)
 }
